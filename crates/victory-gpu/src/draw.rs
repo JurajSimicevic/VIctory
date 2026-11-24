@@ -74,11 +74,10 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, what it holds) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u64), u32>,
-    /// The dynamic slots the list holds: title heap, first, count; given
-    /// back when the list is reset or released.
-    dynamic: Vec<(usize, u32, u32)>,
-    /// A fresh table of the stage being bound could not be made.
-    table_failed: bool,
+    /// The dynamic slots the list holds, given back when the list is reset
+    /// or released; a rejected bind gives back the fresh tables it took
+    /// ([`State::release_rejected_tables`]).
+    dynamic: Vec<Held>,
     /// The title-memory page table made for this list (`crate::memory`)
     /// and its view heap.
     memory: Option<(usize, crate::memory::Map)>,
@@ -91,13 +90,29 @@ pub(crate) struct State {
     root_run: (usize, u32, u32),
 }
 
+/// Dynamic slots a list holds ([`State::dynamic`]).
+struct Held {
+    /// The view heap: a title heap's key, or [`MEMORY_HEAP`].
+    heap: usize,
+    first: u32,
+    count: u32,
+    /// For a table made afresh, its key in [`State::fresh_tables`].
+    table: Option<(u64, u64)>,
+}
+
+impl Held {
+    fn release(&self) {
+        match (self.heap, crate::memory::heap()) {
+            (MEMORY_HEAP, Some(ours)) => ours.release(self.first, self.count),
+            _ => crate::descriptor::release_dynamic(self.heap, self.first, self.count),
+        }
+    }
+}
+
 impl Drop for State {
     fn drop(&mut self) {
-        for &(heap, first, n) in &self.dynamic {
-            match (heap, crate::memory::heap()) {
-                (MEMORY_HEAP, Some(ours)) => ours.release(first, n),
-                _ => crate::descriptor::release_dynamic(heap, first, n),
-            }
+        for held in &self.dynamic {
+            held.release();
         }
     }
 }
@@ -585,9 +600,9 @@ impl State {
             }
             crate::bindless::note_draw(writes);
         }
+        let held_before_bind = self.dynamic.len();
         for stage in &p.stages {
             let t = stage.translated();
-            self.table_failed = false;
             let made = self.tables(list, &t.used, compute);
             // A depth copy of ours made readable a texture the tables hold
             // (`crate::twin`), with a compute pipeline: this one's again
@@ -603,7 +618,8 @@ impl State {
                 self.host_pipeline = p.pso.as_raw() as usize;
                 self.host_roots[1] = if compute { root } else { 0 };
             }
-            if self.table_failed {
+            let Some(made) = made else {
+                self.release_rejected_tables(held_before_bind);
                 static DROPPED_TABLES: AtomicU64 = AtomicU64::new(0);
                 let n = DROPPED_TABLES.fetch_add(1, Ordering::Relaxed) + 1;
                 if n.is_power_of_two() {
@@ -614,7 +630,7 @@ impl State {
                 }
                 not_run("no dynamic slots for its tables");
                 return false;
-            }
+            };
             // Root views a shader reads as title memory: the copies holding
             // their addresses go into the page table.
             let mut roots = Vec::new();
@@ -818,7 +834,12 @@ impl State {
                 once!("no dynamic slots for root views: dropped");
                 return None;
             };
-            self.dynamic.push((key, first, ROOT_VIEW_RUN));
+            self.dynamic.push(Held {
+                heap: key,
+                first,
+                count: ROOT_VIEW_RUN,
+                table: None,
+            });
             self.root_run = (key, first, first + ROOT_VIEW_RUN);
         }
         let index = self.root_run.1;
@@ -883,8 +904,12 @@ impl State {
         let Some(slot) = visible.dynamic(1) else {
             return;
         };
-        self.dynamic
-            .push((std::ptr::from_ref(heap) as usize, slot, 1));
+        self.dynamic.push(Held {
+            heap: std::ptr::from_ref(heap) as usize,
+            first: slot,
+            count: 1,
+            table: None,
+        });
         visible.make_at(slot, &view);
         let at = host.cpu_view();
         let Some(resource) = crate::descriptor::host::make_view(&view, at) else {
@@ -1075,11 +1100,18 @@ impl State {
     /// (translated shaders read them so: the host wants constant buffer
     /// views 256-byte aligned, the console only 16), brought up to date at
     /// submission like other buffer views. Returns the byte offsets of
-    /// tables made afresh in dynamic slots, by root parameter.
+    /// tables made afresh in dynamic slots, by root parameter; `None` when
+    /// the dynamic slots have no room for one, and the bind must then give
+    /// back what it took ([`State::release_rejected_tables`]).
     ///
     /// Within a list, the same table holding the same descriptors is made
     /// once.
-    fn tables(&mut self, list: &HostList, used: &[UsedResource], compute: bool) -> Vec<(u8, u32)> {
+    fn tables(
+        &mut self,
+        list: &HostList,
+        used: &[UsedResource],
+        compute: bool,
+    ) -> Option<Vec<(u8, u32)>> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         let mut fresh: Vec<u8> = Vec::new();
         // Tables reaching past a host heap smaller than the title's (the
@@ -1158,12 +1190,15 @@ impl State {
                 // view: a texture or null descriptor read as a buffer gives
                 // a wild address on AMD and the device is removed (#59).
                 // The draw or dispatch is dropped instead.
-                self.table_failed = true;
-                continue;
+                return None;
             };
             self.fresh_tables.insert(key, first);
-            self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
+            self.dynamic.push(Held {
+                heap: std::ptr::from_ref(heap) as usize,
+                first,
+                count: n,
+                table: Some(key),
+            });
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
@@ -1186,7 +1221,23 @@ impl State {
             }
             made.push((slot, first * 32));
         }
-        made
+        Some(made)
+    }
+
+    /// A rejected bind gives back the tables it made afresh (held from
+    /// `since` on) and forgets them, so that their slots are not held until
+    /// the list is reset (#911); tables earlier binds made stay cached.
+    /// Root views' runs stay held: the next root view takes from the run.
+    fn release_rejected_tables(&mut self, since: usize) {
+        let mut k = since;
+        while k < self.dynamic.len() {
+            let Some(key) = self.dynamic[k].table else {
+                k += 1;
+                continue;
+            };
+            self.dynamic.remove(k).release();
+            self.fresh_tables.remove(&key);
+        }
     }
 
     /// The first draws, at debug level: what they bind and read
@@ -2491,5 +2542,135 @@ void main(uint3 id : SV_DispatchThreadID) {
         drop(found);
         slots.make_null(0);
         assert!(shown.upgrade().is_none(), "released with the slot");
+    }
+
+    /// A bind dropped because a later fresh table has no room gives back
+    /// the fresh tables it made itself and keeps those of earlier binds
+    /// (#911). Tables are made afresh where they reach past a host heap
+    /// smaller than the title's, so the title's heap here is one the host
+    /// caps (1,000,000 views on NVIDIA and WARP); where the host takes it
+    /// whole there is nothing made afresh to test.
+    #[test]
+    fn a_rejected_bind_gives_back_only_its_own_fresh_tables() {
+        use crate::descriptor::{heap, test_view_heap};
+        use crate::pipeline::{Shader, Translated};
+        use victory_shader::HwStage;
+        use victory_shader::emit::HostShader;
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        const TITLE_VIEWS: u32 = 1_000_000;
+        let title_heap = test_view_heap(TITLE_VIEWS);
+        let release_title_heap =
+            || crate::object::slot::<extern "system" fn(This) -> u32>(title_heap, 0x10)(title_heap);
+        let guest = heap(title_heap);
+        let Some(view_heap) = guest.host() else {
+            release_title_heap();
+            return;
+        };
+        let count = view_heap.count();
+        if count + 9 > TITLE_VIEWS {
+            eprintln!("the host takes the whole view heap: no table is made afresh; skipped");
+            release_title_heap();
+            return;
+        }
+        // SAFETY: a live heap.
+        let capacity = unsafe { view_heap.heap.GetDesc() }.NumDescriptors - count;
+
+        let source = b"[numthreads(1,1,1)] void main() {}";
+        let mut code: Option<ID3DBlob> = None;
+        // SAFETY: the source is live and the out pointer is valid.
+        unsafe {
+            D3DCompile(
+                source.as_ptr().cast(),
+                source.len(),
+                s!("test"),
+                None,
+                None,
+                s!("main"),
+                s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                None,
+            )
+        }
+        .unwrap();
+        let code = code.unwrap();
+        // SAFETY: the blob owns the returned byte range.
+        let dxil = unsafe {
+            std::slice::from_raw_parts(code.GetBufferPointer().cast(), code.GetBufferSize())
+        }
+        .to_vec();
+        // Three tables of 2, 4 and 3 constant buffer views.
+        let used = [2, 4, 3]
+            .into_iter()
+            .enumerate()
+            .map(|(slot, size)| UsedResource {
+                kind: ResourceType::Cbv,
+                root: RootType::Table,
+                table_offset_dwords: (size - 1) * 8,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: slot as u8,
+            })
+            .collect();
+        let shader = Shader::test_compute(Translated {
+            host: HostShader {
+                stage: HwStage::Cs,
+                dxil,
+                user_data: Vec::new(),
+                samplers: Vec::new(),
+                static_samplers: Vec::new(),
+                root_cbvs: Vec::new(),
+                root_srvs: Vec::new(),
+                root_uavs: Vec::new(),
+                memory: false,
+                memory_writes: false,
+                view_addresses: false,
+                heap: false,
+                heap_writes: false,
+                view_marks: false,
+            },
+            used,
+        });
+        let pipeline = HostPipeline::new(&[shader], None).unwrap();
+        let list = host.new_list().unwrap();
+        // Title slots past the host heap's: tables there are made afresh.
+        let at = |slot: u32| guest.start + u64::from(slot) * 32;
+
+        let mut state = State::default();
+        state.heaps[0] = title_heap as usize;
+        state.set_table(true, 0, at(count));
+        assert!(state.bind(&list, &pipeline, true));
+        assert_eq!(state.dynamic.len(), 1);
+        let (&accepted_key, &accepted_first) = state.fresh_tables.iter().next().unwrap();
+
+        // Six dynamic slots left after the accepted two-slot table: the
+        // four-slot table fits, the three-slot one after it does not.
+        let blocker = view_heap.dynamic(capacity - 8).unwrap();
+        state.set_table(true, 1, at(count + 2));
+        state.set_table(true, 2, at(count + 6));
+        assert!(!state.bind(&list, &pipeline, true));
+        assert_eq!(
+            state.dynamic.len(),
+            1,
+            "the rejected bind's table given back"
+        );
+        assert_eq!(state.fresh_tables.len(), 1);
+        assert_eq!(state.fresh_tables[&accepted_key], accepted_first);
+        let six = view_heap.dynamic(6).expect("the four slots are free again");
+        assert!(view_heap.dynamic(1).is_none());
+        view_heap.release(six, 6);
+        view_heap.release(blocker, capacity - 8);
+
+        assert!(state.bind(&list, &pipeline, true));
+        assert_eq!(state.dynamic.len(), 3);
+        assert_eq!(state.fresh_tables[&accepted_key], accepted_first);
+        drop(state);
+        release_title_heap();
     }
 }
